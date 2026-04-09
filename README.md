@@ -14,6 +14,8 @@ This repository keeps the core dataset-generation and experiment code at the pro
   - Concise Stage 1 document covering Experiment 1 and Experiment 2.
 - `stage2_exp1.py`
   - Stage 2 Experiment 1 pipeline for frozen local depth probing.
+- `stage2_exp1_random.py`
+  - Random frozen encoder control for the same Stage 2 depth probe.
 - `stage2.md`
   - Concise Stage 2 document for local geometry probing.
 - `setting.md`
@@ -83,6 +85,22 @@ Evaluate:
 ```bash
 conda activate mujoco
 python stage2_exp1.py eval --data-root outputs/datasets/trainable_dataset --checkpoint outputs/experiments/stage2_depth_probe/run_20ep/best.pt --output-dir outputs/experiments/stage2_depth_probe/run_20ep_eval_test --split test
+```
+
+## Run Stage 2 Random Control
+
+Train:
+
+```bash
+conda activate mujoco
+python stage2_exp1_random.py train --data-root outputs/datasets/trainable_dataset --output-dir outputs/experiments/stage2_depth_probe_random/run_20ep --epochs 20 --batch-size 128 --lr 1e-3 --seed 7
+```
+
+Evaluate:
+
+```bash
+conda activate mujoco
+python stage2_exp1_random.py eval --data-root outputs/datasets/trainable_dataset --checkpoint outputs/experiments/stage2_depth_probe_random/run_20ep/best.pt --output-dir outputs/experiments/stage2_depth_probe_random/run_20ep_eval_test --split test
 ```
 
 ## Current Stage

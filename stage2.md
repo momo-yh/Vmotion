@@ -72,6 +72,13 @@ Experiment 1 status:
 - code implemented in `stage2_exp1.py`
 - results not yet filled in
 
+Most important control:
+
+- compare against `stage2_exp1_random.py`
+- same local feature extraction
+- same lightweight depth probe
+- random frozen encoder instead of the motion-trained encoder
+
 What a positive result would mean:
 
 - the motion-trained backbone contains local depth-relevant information at the ball-center feature
