@@ -50,4 +50,5 @@ Before scaling dataset size, verify render quality visually.
 Active top-level scripts:
 
 - `data_generation.py`: rendering + dataset generation
-- `experiment.py`: minimal supervised translation-regression baseline
+- `stage1_exp1.py`: Stage 1 Experiment 1 baseline for 2D ball-center displacement regression
+- `stage1_exp2.py`: Stage 1 Experiment 2 baseline for 3D camera translation regression

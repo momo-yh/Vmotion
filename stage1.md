@@ -1,58 +1,127 @@
-# Stage 1 (Implementation and Usage)
+# Stage 1
 
-> This file explains how to run the current Stage 1 baseline.
-> For experiment assumptions and constraints, refer to `setting.md`.
+> Stage 1 is a representation sanity check.
+> It tests whether adjacent-frame visual input contains usable motion signal and whether the current two-frame architecture can decode that signal reliably.
 
-## 1) Single-file Entry Points
+## Why Stage 1
 
-- `experiment.py`
-  - `train`: supervised regression baseline from two frames to camera translation.
-  - `eval`: evaluation with MAE/RMSE and prediction scatter plots.
-- `data_generation.py`
-  - train/val/test dataset generation and preview export.
+Before claiming anything about local geometry, we first need to verify a simpler prerequisite:
 
-## 2) Prepare Data
+- the two-frame input really contains learnable motion information
+- the current Siamese no-GAP architecture can use that information
 
-```bash
-conda activate mujoco
-python data_generation.py --output-root outputs/datasets/trainable_dataset --train-count 5000 --val-count 500 --test-count 500
-```
+If Stage 1 fails, geometry claims are not justified.
+If Stage 1 succeeds, it becomes reasonable to continue to later geometry probes.
 
-## 3) Train
+## Shared Setup
 
-```bash
-conda activate mujoco
-python experiment.py train \
-  --data-root outputs/datasets/trainable_dataset \
-  --output-dir outputs/experiments/stage1_translation/run_20ep \
-  --epochs 20 \
-  --batch-size 128 \
-  --lr 1e-3
-```
+Input:
 
-Main outputs:
-- `best.pt`
-- `last.pt`
-- `history.json`
-- `curves.png`
-- `summary.json`
+- adjacent RGB frames `I_t` and `I_t+1`
 
-## 4) Evaluate
+Data:
 
-```bash
-conda activate mujoco
-python experiment.py eval \
-  --data-root outputs/datasets/trainable_dataset \
-  --checkpoint outputs/experiments/stage1_translation/run_20ep/best.pt \
-  --output-dir outputs/experiments/stage1_translation/run_20ep_eval_test \
-  --split test
-```
+- `img_t.png`
+- `img_t1.png`
+- `meta.json` with `T_t_to_t1`, `ball_center_2d_t`, `ball_center_2d_t1`
 
-Evaluation outputs:
-- `metrics.json`
-- `prediction_scatter.png`
+Shared model idea:
 
-## 5) Notes
+- two frames are encoded separately with a shared CNN encoder
+- fused feature uses `[F_t, F_t+1, F_t+1 - F_t]`
+- no global average pooling
+- regression is done from spatial feature maps
 
-This Stage 1 setup is a simplified supervised baseline (frame pair -> camera translation) to validate the data/training pipeline first.
-Motion-only geometry conclusions must follow the boundaries in `setting.md`.
+Shared purpose:
+
+- verify that cross-frame motion signal is present and decodable
+
+## Experiment 1
+
+Task:
+
+- decode ball-center 2D image-plane displacement
+
+Input:
+
+- `I_t`, `I_t+1`
+
+Output:
+
+- `(du, dv)`
+
+Target:
+
+- `du = u_t+1 - u_t`
+- `dv = v_t+1 - v_t`
+
+Network:
+
+- shared encoder
+- explicit feature differencing
+- no GAP
+- 2D regression head
+
+Loss:
+
+- L1 loss on `(du, dv)`
+
+What it verifies:
+
+- whether the model can decode a minimal observable motion quantity from two frames
+
+## Experiment 2
+
+Task:
+
+- decode 3D camera translation between adjacent frames
+
+Input:
+
+- `I_t`, `I_t+1`
+
+Output:
+
+- `(tx, ty, tz)`
+
+Target:
+
+- `T_t_to_t1[:3, 3]`
+
+Network:
+
+- same backbone structure as Experiment 1
+- output dimension changed from 2 to 3
+
+Loss:
+
+- L1 loss on `(tx, ty, tz)`
+
+What it verifies:
+
+- whether the model can decode a stronger 3D motion quantity from two frames
+
+Note:
+
+- in the current dataset this is 3D camera translation, not full 6-DoF pose recovery
+
+## Stage 1 Conclusions
+
+Experiment 1 conclusion:
+
+- success
+- test MAE is about `0.333 px`
+- the model can reliably decode 2D image-plane displacement from two adjacent frames
+
+Experiment 2 conclusion:
+
+- success
+- test MAE is about `0.00651 m`
+- the model can reliably decode 3D camera translation from two adjacent frames
+
+Overall Stage 1 conclusion:
+
+- the current two-frame visual setup contains strong learnable motion signal
+- the current Siamese no-GAP architecture can decode both a minimal 2D motion target and a stronger 3D translation target
+- this supports moving on to later geometry-focused experiments
+- this still does not prove that local geometry has emerged in the ball-center feature
