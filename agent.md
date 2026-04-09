@@ -2,9 +2,9 @@
 
 ## Source Of Truth
 
-Use [setting.md](./setting.md) as the primary experiment spec.
+Use [setting.md](./setting.md) as the primary experiment specification.
 
-If code and `setting.md` disagree, update the code to match `setting.md`.
+If implementation and `setting.md` disagree, update implementation to match `setting.md`.
 
 ## Environment
 
@@ -14,46 +14,40 @@ Use the conda environment:
 conda activate mujoco
 ```
 
-Assume a simple deterministic pinhole renderer is preferred unless the user explicitly asks for a simulator-backed renderer.
+Assume a simple deterministic pinhole renderer unless the user explicitly requests a simulator-backed renderer.
 
 ## Dataset Expectations
 
-The rendered dataset should follow the experiment spec:
+The dataset should follow the experiment specification:
 
-* static scene
-* one sphere
-* one tabletop
-* one wall
-* only camera motion between `t` and `t+1`
+- static scene
+- one sphere
+- one tabletop
+- one wall
+- only camera motion between `t` and `t+1`
 
-Each sample should expose:
+Each sample should include:
 
-* `img_t.png`
-* `img_t1.png`
-* camera intrinsics `K`
-* relative pose `T_t_to_t1`
-* `ball_center_3d_t`
-* `ball_center_2d_t`
-* `ball_center_2d_t1`
+- `img_t.png`
+- `img_t1.png`
+- camera intrinsics `K`
+- relative pose `T_t_to_t1`
+- `ball_center_3d_t`
+- `ball_center_2d_t`
+- `ball_center_2d_t1`
 
 ## Working Style
 
 Prefer small, inspectable outputs first:
 
-* preview grids
-* readable `meta.json`
+- preview grids
+- readable `meta.json`
 
-Before scaling dataset size up, verify the render quality visually.
+Before scaling dataset size, verify render quality visually.
 
 ## File Layout
 
-Keep experiments isolated.
+Active top-level scripts:
 
-Active top-level code areas:
-
-* `data_gen/`
-  Rendering, dataset generation, shared dataset loader.
-* `experiments/stage1_translation/`
-  Minimal supervised translation-regression baseline.
-
-Do not mix experiment-specific training code back into `data_gen/`.
+- `data_generation.py`: rendering + dataset generation
+- `experiment.py`: minimal supervised translation-regression baseline
