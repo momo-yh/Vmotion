@@ -1,0 +1,130 @@
+The search radius precondition is not checked:
+pythonradius = args.radius   # default 6
+There is no assertion that r >= max_displacement / 4 before the correlation is computed. As discussed, this is a silent failure mode. One line would close it:
+pythonassert radius >= expected_max_displacement / 4, \
+    "Search radius too small — true matches fall outside window"
+
+
+Part 1 — Visualizing whether the three things are learned
+Each of the three claims needs a different visualization:
+
+Claim 1 — Motion-sensitive local features
+The question is: do features respond differently to different motions?
+Visualization: Feature Response Map
+
+for each motion type (left, right, up, down):
+    take a frame pair
+    compute C_t[p, :] at every p
+    compute the peak displacement at each p:
+        peak(p) = argmax over q of C_t[p, q]
+    
+    draw on image:
+        color = displacement direction at p
+        brightness = confidence (max score at p)
+
+→  save as  motion_response_{left,right,up,down}.png
+
+Expected pattern:
+    left translation  →  uniform rightward arrows
+    right translation →  uniform leftward arrows
+    deeper regions    →  shorter arrows
+    shallow regions   →  longer arrows
+
+Claim 2 — Temporal correspondence
+The question is: does the model find the correct match across frames?
+Visualization: Correspondence Map
+
+pick N random positions p in frame t
+for each p:
+    find best match q* = argmax over q of C_t[p, q]
+    draw line from p in frame t to q* in frame t+1
+
+→  save as  correspondence_overlay.png
+
+Expected pattern:
+    lines should be parallel and consistent
+    line length should vary with depth
+    (shallow points → long lines,
+     deep points    → short lines)
+
+Claim 3 — Spatial relations / geometric layout
+The question is: does the displacement field have geometric structure consistent with the camera model?
+Visualization: Depth-from-Displacement Map
+
+given a frame pair with known translation direction:
+    at each position p:
+        mu(p) = expected displacement from C_t[p, :]
+        Z_hat(p) = fx * tau_x / mu_x(p)   ← recovered depth
+
+    draw Z_hat as a heatmap over the image
+
+→  save as  recovered_depth_map.png
+
+compare side by side with:
+    ground truth depth map
+
+Expected pattern:
+    recovered depth should correlate with ground truth
+    especially at ball center where the signal is clear
+
+Part 2 — Full image depth decoding for downstream use
+Two levels to test:
+
+Level A — direct geometric recovery (no learning)
+    given frozen encoder + both frames + known tau:
+        C_t = correlation(Z_t, Z_t+1)
+        for each p:
+            mu(p) = sum_q a(p,q) * (q-p)   soft displacement
+            Z_hat(p) = fx * tau_x / (mu_x(p) * 4)
+                                      ↑
+                              factor 4 for downsampling
+        upsample Z_hat to original resolution
+    
+    → no probe training needed
+    → purely geometric
+    → tests claim 2 directly
+
+Level B — learned depth decoder (for downstream)
+    freeze encoder
+    for each p in full image:
+        feat = C_t[p, :]
+    train a small decoder:
+        input:  C_t  [H', W', (2r+1)^2]
+        output: depth map  [H', W', 1]
+        architecture: two 1x1 conv layers + upsample
+        loss: L1 on normalized depth
+    
+    → this is the downstream-ready model
+    → tests whether full spatial depth is decodable
+
+Concrete output layout
+output/
+├── motion_response/
+│   ├── left.png          ← claim 1
+│   ├── right.png
+│   ├── up.png
+│   └── down.png
+│
+├── correspondence/
+│   └── overlay.png       ← claim 2
+│
+├── depth_recovery/
+│   ├── geometric.png     ← claim 3, level A
+│   └── gt_comparison.png
+│
+└── depth_decoder/
+    ├── pred_depth.png    ← level B, downstream
+    ├── gt_depth.png
+    └── error_map.png
+
+Key distinction between Level A and Level B
+Level A:  Z_hat(p) = fx * tau_x / mu_x(p)
+          purely geometric, no training
+          only valid for left/right translation
+          proves the displacement field is geometrically correct
+
+Level B:  depth decoder trained on C_t
+          learns the mapping
+          generalizes across motion types
+          ready for depth4control downstream use
+Level A is the honest scientific test — it proves the geometry is there without any additional learning. Level B is the practical test — it proves the representation is usable for a real downstream task.
