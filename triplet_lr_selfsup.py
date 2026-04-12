@@ -60,7 +60,7 @@ def train(args: argparse.Namespace) -> None:
     output_dir = ensure_dir(args.output_dir)
     train_loader = build_loader(args.data_root, "train", args.batch_size, shuffle=True)
     val_loader = build_loader(args.data_root, "val", args.batch_size, shuffle=False)
-    model = TripletLRSelfSupModel(radius=args.radius).to(args.device)
+    model = TripletLRSelfSupModel(radius=args.radius, corr_temperature=args.corr_temperature).to(args.device)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
     history = []
     best_val = float("inf")
@@ -94,6 +94,7 @@ def train(args: argparse.Namespace) -> None:
                     "depth_min": model.depth_min,
                     "depth_max": model.depth_max,
                     "eps": model.eps,
+                    "corr_temperature": model.corr_temperature,
                 },
                 output_dir / "best.pt",
             )
@@ -108,6 +109,7 @@ def train(args: argparse.Namespace) -> None:
                 "depth_min": model.depth_min,
                 "depth_max": model.depth_max,
                 "eps": model.eps,
+                "corr_temperature": model.corr_temperature,
             },
             output_dir / "last.pt",
         )
@@ -142,6 +144,7 @@ def evaluate(args: argparse.Namespace) -> None:
         depth_min=ckpt["depth_min"],
         depth_max=ckpt["depth_max"],
         eps=ckpt["eps"],
+        corr_temperature=ckpt.get("corr_temperature", 0.07),
     ).to(args.device)
     model.load_state_dict(ckpt["model_state"])
     loader = build_loader(args.data_root, args.split, args.batch_size, shuffle=False)
@@ -165,6 +168,7 @@ def build_argparser() -> argparse.ArgumentParser:
     train_parser.add_argument("--device", type=str, default="cpu")
     train_parser.add_argument("--patience", type=int, default=4)
     train_parser.add_argument("--min-delta", type=float, default=1e-4)
+    train_parser.add_argument("--corr-temperature", type=float, default=0.07)
 
     eval_parser = sub.add_parser("eval")
     eval_parser.add_argument("--data-root", type=str, required=True)

@@ -85,10 +85,11 @@ class RegionEncoder(nn.Module):
 
 
 class LocalCorrelation(nn.Module):
-    def __init__(self, radius: int = 6) -> None:
+    def __init__(self, radius: int = 6, temperature: float = 0.07) -> None:
         super().__init__()
         self.radius = radius
         self.kernel_size = 2 * radius + 1
+        self.temperature = temperature
 
     def forward(self, f_a: torch.Tensor, f_b: torch.Tensor) -> torch.Tensor:
         bsz, channels, height, width = f_a.shape
@@ -96,7 +97,7 @@ class LocalCorrelation(nn.Module):
         b = F.normalize(f_b, dim=1)
         patches = F.unfold(b, kernel_size=self.kernel_size, padding=self.radius)
         patches = patches.view(bsz, channels, self.kernel_size * self.kernel_size, height, width)
-        corr = (a.unsqueeze(2) * patches).sum(dim=1) / math.sqrt(channels)
+        corr = (a.unsqueeze(2) * patches).sum(dim=1) / self.temperature
         return corr
 
 
@@ -107,15 +108,16 @@ def correlation_offsets(radius: int, device: str | torch.device) -> tuple[torch.
 
 
 class TripletLRSelfSupModel(nn.Module):
-    def __init__(self, radius: int = 6, downsample: int = 4, depth_min: float = 0.2, depth_max: float = 2.2, eps: float = 1e-3) -> None:
+    def __init__(self, radius: int = 6, downsample: int = 4, depth_min: float = 0.2, depth_max: float = 2.2, eps: float = 1e-3, corr_temperature: float = 0.07) -> None:
         super().__init__()
         self.encoder = RegionEncoder(out_channels=128)
-        self.correlation = LocalCorrelation(radius=radius)
+        self.correlation = LocalCorrelation(radius=radius, temperature=corr_temperature)
         self.radius = radius
         self.downsample = downsample
         self.depth_min = depth_min
         self.depth_max = depth_max
         self.eps = eps
+        self.corr_temperature = corr_temperature
 
     def forward(self, img_t: torch.Tensor, img_t1: torch.Tensor, img_t2: torch.Tensor, tau1_x: torch.Tensor, tau2_x: torch.Tensor, K: torch.Tensor) -> dict[str, torch.Tensor]:
         f_t = self.encoder(img_t)
@@ -133,20 +135,20 @@ class TripletLRSelfSupModel(nn.Module):
 
         fx = K[:, 0, 0].view(-1, 1, 1)
         delta_u = mu1_x * float(self.downsample)
-        d_rel = fx * tau1_x.view(-1, 1, 1) / (delta_u + self.eps * torch.sign(tau1_x).view(-1, 1, 1))
-        d_rel = torch.clamp(d_rel.abs(), min=self.depth_min, max=self.depth_max)
+        depth_raw = fx * tau1_x.view(-1, 1, 1) / (delta_u + self.eps * torch.sign(tau1_x).view(-1, 1, 1))
+        d_rel = torch.clamp(depth_raw, min=self.depth_min, max=self.depth_max)
 
         bsz, _, h, w = c1.shape
         xs = torch.arange(w, device=c1.device, dtype=torch.float32).view(1, 1, w).expand(bsz, h, w)
         ys = torch.arange(h, device=c1.device, dtype=torch.float32).view(1, h, 1).expand(bsz, h, w)
-        q_pred_x = xs + fx * tau2_x.view(-1, 1, 1) / (d_rel * float(self.downsample))
+        q_pred_x = xs + mu1_x * (tau2_x.view(-1, 1, 1) / (tau1_x.view(-1, 1, 1) + self.eps * torch.sign(tau1_x).view(-1, 1, 1)))
         q_pred_y = ys
         q_actual_x = xs + mu2_x
         q_actual_y = ys + mu2_y
 
         valid = (
-            torch.isfinite(d_rel)
-            & (d_rel > 0.0)
+            torch.isfinite(depth_raw)
+            & (depth_raw > 0.0)
             & (q_pred_x >= 0.0)
             & (q_pred_x <= (w - 1))
             & (q_pred_y >= 0.0)
@@ -167,6 +169,7 @@ class TripletLRSelfSupModel(nn.Module):
             "mu1_x": mu1_x,
             "mu2_x": mu2_x,
             "mu2_y": mu2_y,
+            "depth_raw": depth_raw,
             "d_rel": d_rel,
             "q_pred_x": q_pred_x,
             "q_actual_x": q_actual_x,

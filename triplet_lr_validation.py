@@ -42,6 +42,7 @@ def load_backbone(checkpoint_path: str | Path, device: str) -> TripletLRSelfSupM
         depth_min=ckpt["depth_min"],
         depth_max=ckpt["depth_max"],
         eps=ckpt["eps"],
+        corr_temperature=ckpt.get("corr_temperature", 0.07),
     )
     model.load_state_dict(ckpt["model_state"])
     model.to(device).eval()
@@ -236,6 +237,176 @@ def visualize_correspondence(model: TripletLRSelfSupModel, data_root: str, split
     canvas.save(output_dir / "overlay.png")
 
 
+def visualize_dense_correspondence(model: TripletLRSelfSupModel, data_root: str, split: str, output_dir: Path, device: str) -> dict[str, float]:
+    output_dir = ensure_dir(output_dir / "correspondence_dense")
+    dataset = TripletLRTwoBallDataset(data_root, split)
+    chosen = select_extreme_samples(data_root, split)
+    sample = next(dataset[i] for i in range(len(dataset)) if dataset[i]["sample_id"] == chosen["right"])
+    sample_dir = Path(data_root) / split / sample["sample_id"]
+    img = np.asarray(Image.open(sample_dir / "img_t.png").convert("RGB"), dtype=np.float32) / 255.0
+    out = get_model_outputs(model, sample, device)
+    c1 = out["c1"][0].detach().cpu()
+    a1 = out["a1"][0].detach().cpu()
+    radius = model.radius
+    dx, dy = correlation_offsets(radius, "cpu")
+    peak = c1.argmax(dim=0)
+    conf = a1.max(dim=0).values.numpy()
+    peak_dx = dx[peak].numpy()
+    peak_dy = dy[peak].numpy()
+    mean_abs_dx = float(np.abs(peak_dx).mean())
+    std_dx = float(np.std(peak_dx))
+    frac_center = float((peak_dx == 0).mean())
+
+    peak_dx_up = np.asarray(Image.fromarray(peak_dx.astype(np.float32), mode="F").resize((128, 128), Image.Resampling.NEAREST))
+    conf_up = np.asarray(Image.fromarray(conf.astype(np.float32), mode="F").resize((128, 128), Image.Resampling.NEAREST))
+    dx_norm = (peak_dx_up - peak_dx_up.min()) / max(float(peak_dx_up.max() - peak_dx_up.min()), 1e-6)
+    conf_norm = (conf_up - conf_up.min()) / max(float(conf_up.max() - conf_up.min()), 1e-6)
+
+    fig, axes = plt.subplots(1, 3, figsize=(12, 4))
+    axes[0].imshow(img)
+    axes[0].set_title("img_t")
+    axes[0].axis("off")
+    axes[1].imshow(dx_norm, cmap="coolwarm")
+    axes[1].set_title("dense peak displacement")
+    axes[1].axis("off")
+    axes[2].imshow(conf_norm, cmap="viridis")
+    axes[2].set_title("dense peak confidence")
+    axes[2].axis("off")
+    fig.tight_layout()
+    fig.savefig(output_dir / "dense_correspondence.png", dpi=180)
+    plt.close(fig)
+
+    return {
+        "mean_abs_peak_dx_feat": mean_abs_dx,
+        "std_peak_dx_feat": std_dx,
+        "fraction_zero_peak_dx": frac_center,
+    }
+
+
+def visualize_match_patches(model: TripletLRSelfSupModel, data_root: str, split: str, output_dir: Path, device: str, top_k: int = 6, low_k: int = 6) -> dict[str, float]:
+    output_dir = ensure_dir(output_dir / "match_patches")
+    dataset = TripletLRTwoBallDataset(data_root, split)
+    chosen = select_extreme_samples(data_root, split)
+    sample = next(dataset[i] for i in range(len(dataset)) if dataset[i]["sample_id"] == chosen["right"])
+    sample_dir = Path(data_root) / split / sample["sample_id"]
+    img_t = np.asarray(Image.open(sample_dir / "img_t.png").convert("RGB"))
+    img_t1 = np.asarray(Image.open(sample_dir / "img_t1.png").convert("RGB"))
+    out = get_model_outputs(model, sample, device)
+    c1 = out["c1"][0].detach().cpu()
+    a1 = out["a1"][0].detach().cpu()
+    radius = model.radius
+    dx, dy = correlation_offsets(radius, "cpu")
+    peak = c1.argmax(dim=0)
+    conf = a1.max(dim=0).values.numpy().reshape(-1)
+    order_hi = np.argsort(conf)[::-1][:top_k]
+    order_lo = np.argsort(conf)[:low_k]
+
+    def draw_group(indices, out_name, title_prefix):
+        fig, axes = plt.subplots(len(indices), 4, figsize=(10, 3 * len(indices)))
+        if len(indices) == 1:
+            axes = np.expand_dims(axes, axis=0)
+        for row, flat_idx in enumerate(indices):
+            y = flat_idx // c1.shape[2]
+            x = flat_idx % c1.shape[2]
+            peak_idx = peak[y, x].item()
+            px = float((x + 0.5) * model.downsample)
+            py = float((y + 0.5) * model.downsample)
+            qx = float((x + dx[peak_idx].item() + 0.5) * model.downsample)
+            qy = float((y + dy[peak_idx].item() + 0.5) * model.downsample)
+            patch = c1[:, y, x].reshape(2 * radius + 1, 2 * radius + 1).numpy()
+
+            ax0, ax1, ax2, ax3 = axes[row]
+            ax0.imshow(img_t)
+            ax0.scatter([px], [py], c="cyan", s=30)
+            ax0.set_title(f"{title_prefix} src ({x},{y})")
+            ax0.axis("off")
+
+            ax1.imshow(img_t1)
+            ax1.scatter([qx], [qy], c="orange", s=30)
+            ax1.set_title(f"matched ({qx:.1f},{qy:.1f})")
+            ax1.axis("off")
+
+            ax2.imshow(patch, cmap="viridis")
+            ax2.set_title(f"corr patch\nconf={conf[flat_idx]:.3f}")
+            ax2.axis("off")
+
+            ax3.imshow(torch.softmax(torch.from_numpy(patch.reshape(-1)), dim=0).reshape(patch.shape).numpy(), cmap="magma")
+            ax3.set_title("softmax patch")
+            ax3.axis("off")
+        fig.tight_layout()
+        fig.savefig(output_dir / out_name, dpi=180)
+        plt.close(fig)
+
+    draw_group(order_hi, "top_match_patches.png", "top")
+    draw_group(order_lo, "low_match_patches.png", "low")
+    return {
+        "top_conf_mean": float(conf[order_hi].mean()),
+        "low_conf_mean": float(conf[order_lo].mean()),
+    }
+
+
+def export_sharp_peak_points(model: TripletLRSelfSupModel, data_root: str, split: str, output_dir: Path, device: str, top_k: int = 24) -> dict[str, float]:
+    output_dir = ensure_dir(output_dir / "sharp_peaks")
+    dataset = TripletLRTwoBallDataset(data_root, split)
+    chosen = select_extreme_samples(data_root, split)
+    sample = next(dataset[i] for i in range(len(dataset)) if dataset[i]["sample_id"] == chosen["right"])
+    sample_dir = Path(data_root) / split / sample["sample_id"]
+    img_t = Image.open(sample_dir / "img_t.png").convert("RGB")
+    img_t1 = Image.open(sample_dir / "img_t1.png").convert("RGB")
+    out = get_model_outputs(model, sample, device)
+    c1 = out["c1"][0].detach().cpu()
+    a1 = out["a1"][0].detach().cpu()
+    radius = model.radius
+    dx, dy = correlation_offsets(radius, "cpu")
+
+    probs = a1.view(a1.shape[0], -1).transpose(0, 1)
+    top2_vals, top2_idx = torch.topk(probs, k=2, dim=1)
+    entropy = -(probs.clamp_min(1e-12) * probs.clamp_min(1e-12).log()).sum(dim=1)
+    sharpness = top2_vals[:, 0] - top2_vals[:, 1]
+    score = sharpness - 0.05 * entropy
+    chosen_idx = torch.topk(score, k=min(top_k, score.numel())).indices.tolist()
+
+    records = []
+    canvas = Image.new("RGB", (img_t.width * 2 + 20, img_t.height), color=(255, 255, 255))
+    canvas.paste(img_t, (0, 0))
+    canvas.paste(img_t1, (img_t.width + 20, 0))
+    draw = ImageDraw.Draw(canvas)
+
+    for rank, flat_idx in enumerate(chosen_idx, start=1):
+        y = flat_idx // c1.shape[2]
+        x = flat_idx % c1.shape[2]
+        peak_idx = top2_idx[flat_idx, 0].item()
+        px = float((x + 0.5) * model.downsample)
+        py = float((y + 0.5) * model.downsample)
+        qx = float((x + dx[peak_idx].item() + 0.5) * model.downsample)
+        qy = float((y + dy[peak_idx].item() + 0.5) * model.downsample)
+        records.append(
+            {
+                "rank": rank,
+                "feature_xy": [int(x), int(y)],
+                "image_xy_t": [round(px, 2), round(py, 2)],
+                "image_xy_t1_match": [round(qx, 2), round(qy, 2)],
+                "top_prob": float(top2_vals[flat_idx, 0].item()),
+                "second_prob": float(top2_vals[flat_idx, 1].item()),
+                "margin": float(sharpness[flat_idx].item()),
+                "entropy": float(entropy[flat_idx].item()),
+                "score": float(score[flat_idx].item()),
+            }
+        )
+        color = (255, 120, 0)
+        draw.ellipse((px - 2, py - 2, px + 2, py + 2), fill=color)
+        draw.ellipse((img_t.width + 20 + qx - 2, qy - 2, img_t.width + 20 + qx + 2, qy + 2), fill=color)
+        draw.text((px + 3, py - 8), str(rank), fill=color)
+
+    save_json(records, output_dir / "sharp_peaks.json")
+    canvas.save(output_dir / "sharp_peaks_overlay.png")
+    return {
+        "sharp_peak_count": float(len(records)),
+        "sharp_peak_top_score": float(records[0]["score"]) if records else 0.0,
+        "sharp_peak_top_margin": float(records[0]["margin"]) if records else 0.0,
+    }
+
+
 def evaluate_matching_error(model: TripletLRSelfSupModel, data_root: str, split: str, device: str) -> dict[str, float]:
     dataset = TripletValidationDataset(data_root, split)
     errs = []
@@ -409,6 +580,9 @@ def run_bundle(args: argparse.Namespace) -> None:
 
     visualize_motion_response(model, args.data_root, "test", output_dir, args.device)
     visualize_correspondence(model, args.data_root, "test", output_dir, args.device)
+    dense_corr_metrics = visualize_dense_correspondence(model, args.data_root, "test", output_dir, args.device)
+    patch_metrics = visualize_match_patches(model, args.data_root, "test", output_dir, args.device)
+    sharp_peak_metrics = export_sharp_peak_points(model, args.data_root, "test", output_dir, args.device)
     matching_metrics = evaluate_matching_error(model, args.data_root, "test", args.device)
     geom_metrics = visualize_geometric_depth(model, args.data_root, "test", output_dir, args.device)
     visualize_encoder_features(model, args.data_root, "test", output_dir, args.device)
@@ -466,6 +640,9 @@ def run_bundle(args: argparse.Namespace) -> None:
     sf_metrics = eval_depth_decoder(test_loader, single_frame_feature_fn, sf_best, args.device, sf_dir / "eval_test")
 
     summary = {
+        "dense_correspondence": dense_corr_metrics,
+        "match_patch_confidence": patch_metrics,
+        "sharp_peaks": sharp_peak_metrics,
         "matching": matching_metrics,
         "geometric_recovery": geom_metrics,
         "depth_probe_corr": corr_metrics,
@@ -482,6 +659,14 @@ def write_report(output_dir: Path, summary: dict) -> None:
         "",
         "## Summary Metrics",
         "",
+        f"- dense peak displacement mean abs dx: `{summary['dense_correspondence']['mean_abs_peak_dx_feat']:.4f}`",
+        f"- dense peak displacement std dx: `{summary['dense_correspondence']['std_peak_dx_feat']:.4f}`",
+        f"- dense fraction zero-peak dx: `{summary['dense_correspondence']['fraction_zero_peak_dx']:.4f}`",
+        f"- top patch confidence mean: `{summary['match_patch_confidence']['top_conf_mean']:.4f}`",
+        f"- low patch confidence mean: `{summary['match_patch_confidence']['low_conf_mean']:.4f}`",
+        f"- sharp peak count exported: `{summary['sharp_peaks']['sharp_peak_count']:.0f}`",
+        f"- best sharp-peak score: `{summary['sharp_peaks']['sharp_peak_top_score']:.4f}`",
+        f"- best sharp-peak margin: `{summary['sharp_peaks']['sharp_peak_top_margin']:.4f}`",
         f"- mean matching error on feature map: `{summary['matching']['mean_abs_disp_error_feat']:.4f}`",
         f"- geometric recovery MAE: `{summary['geometric_recovery']['mae_m']:.4f} m`",
         f"- geometric recovery RMSE: `{summary['geometric_recovery']['rmse_m']:.4f} m`",
@@ -509,6 +694,11 @@ def write_report(output_dir: Path, summary: dict) -> None:
         "- `motion_response/left.png`",
         "- `motion_response/right.png`",
         "- `correspondence/overlay.png`",
+        "- `correspondence_dense/dense_correspondence.png`",
+        "- `sharp_peaks/sharp_peaks_overlay.png`",
+        "- `sharp_peaks/sharp_peaks.json`",
+        "- `match_patches/top_match_patches.png`",
+        "- `match_patches/low_match_patches.png`",
         "- `depth_recovery/geometric.png`",
         "- `depth_recovery/gt_comparison.png`",
         "- `encoder_features/encoder_feature_maps.png`",
