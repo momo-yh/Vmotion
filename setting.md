@@ -121,7 +121,7 @@ The implementation has five parts:
 - a 1D horizontal correlation module
 - soft displacement recovery
 - depth-based third-frame prediction
-- a single per-point loss with a hard physical mask
+- a visible-only hard physical mask and two loss terms (`L_geom` + `L_sharp`)
 
 ### 3.1 Region Encoder
 
@@ -243,18 +243,9 @@ q_actual_y(p) = p_y
 
 Step 5: hard physical mask
 
-Only points that satisfy both physically necessary conditions are supervised.
+Only points that are still visible in frame `t+2` are supervised.
 
-Condition 1: the point is matchable
-
-```text
-peak(a_1(p, .)) > k / (2r+1)
-```
-
-If the strip is nearly flat, then the point is textureless or ambiguous and
-`mu_1x(p)` is not a reliable displacement estimate.
-
-Condition 2: the point is still visible in frame `t+2`
+Condition: the point is still visible in frame `t+2`
 
 ```text
 q_pred(p) in Omega'
@@ -266,7 +257,7 @@ observation to compare against.
 The hard mask is therefore:
 
 ```text
-m(p) = 1 if both conditions hold, else 0
+m(p) = 1 if visible condition holds, else 0
 ```
 
 ### 3.5 Training Objective
@@ -281,19 +272,37 @@ scene center:
 Samples below this threshold are excluded from training.
 This keeps `D_rel` numerically stable across the dataset.
 
-Per-point loss:
+Per-point geometric loss:
 
 ```text
-L(p) = (q_pred_x(p) - q_actual_x(p))^2
+L_point(p) = (q_pred_x(p) - q_actual_x(p))^2
+```
+
+Geometric term:
+
+```text
+L_geom = mean over { p : m(p) = 1 } of L_point(p)
+```
+
+Sharpness regularizer (using both `a_1` and `a_2`):
+
+```text
+H1(p) = - sum_dx a_1(p,dx) * log(a_1(p,dx) + eps)
+H2(p) = - sum_dx a_2(p,dx) * log(a_2(p,dx) + eps)
+
+H1_norm(p) = H1(p) / log(2r+1)
+H2_norm(p) = H2(p) / log(2r+1)
+
+L_sharp = mean over { p : m(p) = 1 } of (H1_norm(p) + H2_norm(p)) / 2
 ```
 
 Total loss:
 
 ```text
-L = mean over { p : m(p) = 1 } of L(p)
+L_total = L_geom + lambda_sharp * L_sharp
 ```
 
-This is the only loss term in the final cleaned version.
+with a small default such as `lambda_sharp = 0.02`.
 
 ## 4) Validation
 

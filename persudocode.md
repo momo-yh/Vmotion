@@ -4,8 +4,8 @@ This is the final cleaned version:
 - 1D horizontal correlation only
 - no learned mask
 - no consistency loss term in the objective
-- one per-point loss term only
-- hard mask with two conditions: matchable and visible
+- visible-only hard mask
+- per-point loss + sharpness loss on both a1 and a2
 
 ============================================================
 MINIMAL THREE-FRAME PIPELINE
@@ -77,36 +77,36 @@ STAGE 6 - Actual Position from C2
 
 ------------------------------------------------------------
 STAGE 7 - Hard Mask
-  Condition 1: point is matchable
-
-    peak(a1(p, .)) > k / (2r + 1)
-
-  In code:
-    peak_a1 = max_dx a1(p, dx)
-    threshold = matchability_k / (2r + 1)
-
-  Condition 2: point is visible in frame t+2
+  Condition: point is visible in frame t+2
 
     q_pred_x(p) in [0, W' - 1]
     q_pred_y(p) in [0, H' - 1]
 
-  Combined mask:
+  Mask:
 
-    m(p) = 1 if both conditions hold, else 0
-
-  Current default:
-    matchability_k = 2.0
+    m(p) = 1 if visible, else 0
 
 ------------------------------------------------------------
-STAGE 8 - Per-Point Loss
+STAGE 8 - Losses
   L_point(p) = (q_pred_x(p) - q_actual_x(p))^2
 
-  L =
+  L_geom =
       sum_p m(p) * L_point(p)
       -----------------------
       sum_p m(p) + eps
 
-  This is the only training loss term.
+  H1(p) = -sum_dx a1(p, dx) * log(a1(p, dx) + eps)
+  H2(p) = -sum_dx a2(p, dx) * log(a2(p, dx) + eps)
+
+  H1_norm(p) = H1(p) / log(2r + 1)
+  H2_norm(p) = H2(p) / log(2r + 1)
+
+  L_sharp =
+      sum_p m(p) * (H1_norm(p) + H2_norm(p)) / 2
+      -------------------------------------------
+      sum_p m(p) + eps
+
+  L_total = L_geom + lambda_sharp * L_sharp
 
 ============================================================
 FULL FORWARD PASS
@@ -119,8 +119,10 @@ FULL FORWARD PASS
   D_rel           = DepthRecovery(mu1_x, tau1_x, fx, s)
   q_pred          = PredictPosition(mu1_x, tau1_x, tau2_x)
   q_actual        = ActualPosition(mu2_x)
-  m               = HardMask(a1, q_pred)
-  L               = PerPointLoss(q_pred, q_actual, m)
+  m               = HardMask(q_pred)
+  L_geom          = PerPointLoss(q_pred, q_actual, m)
+  L_sharp         = SharpnessLoss(a1, a2, m)
+  L_total         = L_geom + lambda_sharp * L_sharp
 
 ============================================================
 INFERENCE

@@ -28,6 +28,7 @@ def run_epoch(model: TripletLRSelfSupModel, loader: DataLoader, optimizer: torch
     model.train(train_mode)
     losses = []
     perpoint_losses = []
+    sharpness_losses = []
     abs_x = []
     valid_frac = []
     mask_frac = []
@@ -49,6 +50,7 @@ def run_epoch(model: TripletLRSelfSupModel, loader: DataLoader, optimizer: torch
             optimizer.step()
         losses.append(float(loss.item()))
         perpoint_losses.append(float(out["perpoint_loss"].item()))
+        sharpness_losses.append(float(out["sharpness_loss"].item()))
         valid = out["valid"]
         abs_err_x = torch.abs(out["q_pred_x"] - out["q_actual_x"])
         abs_x.append(float((abs_err_x * valid.float()).sum().item() / valid.float().sum().clamp_min(1.0).item()))
@@ -59,6 +61,7 @@ def run_epoch(model: TripletLRSelfSupModel, loader: DataLoader, optimizer: torch
     return {
         "loss": float(np.mean(losses)),
         "perpoint_loss": float(np.mean(perpoint_losses)),
+        "sharpness_loss": float(np.mean(sharpness_losses)),
         "abs_x_feat": float(np.mean(abs_x)),
         "valid_fraction": float(np.mean(valid_frac)),
         "mask_mean": float(np.mean(mask_frac)),
@@ -75,7 +78,7 @@ def train(args: argparse.Namespace) -> None:
     model = TripletLRSelfSupModel(
         radius=args.radius,
         corr_temperature=args.corr_temperature,
-        matchability_k=args.matchability_k,
+        lambda_sharp=args.lambda_sharp,
     ).to(args.device)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
     history = []
@@ -90,6 +93,7 @@ def train(args: argparse.Namespace) -> None:
             "epoch": epoch,
             "train_loss": train_metrics["loss"],
             "train_perpoint_loss": train_metrics["perpoint_loss"],
+            "train_sharpness_loss": train_metrics["sharpness_loss"],
             "train_abs_x_feat": train_metrics["abs_x_feat"],
             "train_valid_fraction": train_metrics["valid_fraction"],
             "train_mask_mean": train_metrics["mask_mean"],
@@ -97,6 +101,7 @@ def train(args: argparse.Namespace) -> None:
             "train_peak_a1_mean": train_metrics["peak_a1_mean"],
             "val_loss": val_metrics["loss"],
             "val_perpoint_loss": val_metrics["perpoint_loss"],
+            "val_sharpness_loss": val_metrics["sharpness_loss"],
             "val_abs_x_feat": val_metrics["abs_x_feat"],
             "val_valid_fraction": val_metrics["valid_fraction"],
             "val_mask_mean": val_metrics["mask_mean"],
@@ -119,7 +124,7 @@ def train(args: argparse.Namespace) -> None:
                     "depth_max": model.depth_max,
                     "eps": model.eps,
                     "corr_temperature": model.corr_temperature,
-                    "matchability_k": model.matchability_k,
+                    "lambda_sharp": model.lambda_sharp,
                 },
                 output_dir / "best.pt",
             )
@@ -135,13 +140,13 @@ def train(args: argparse.Namespace) -> None:
                 "depth_max": model.depth_max,
                 "eps": model.eps,
                 "corr_temperature": model.corr_temperature,
-                "matchability_k": model.matchability_k,
+                "lambda_sharp": model.lambda_sharp,
             },
             output_dir / "last.pt",
         )
         print(
             f"epoch {epoch:03d} | train_loss={train_metrics['loss']:.6f} | "
-            f"val_loss={val_metrics['loss']:.6f} | val_peak={val_metrics['peak_a1_mean']:.3f} | "
+            f"val_loss={val_metrics['loss']:.6f} | val_sharp={val_metrics['sharpness_loss']:.4f} | val_peak={val_metrics['peak_a1_mean']:.3f} | "
             f"val_mask={val_metrics['mask_mean']:.3f} | val_valid={val_metrics['valid_fraction']:.3f}"
         )
         if epochs_without_improvement >= args.patience:
@@ -149,6 +154,7 @@ def train(args: argparse.Namespace) -> None:
             break
 
     plot_history(history, output_dir / "training_curve.png", "Three-Frame LR Self-Supervised Training", ["train_loss", "val_loss"])
+    plot_history(history, output_dir / "sharpness_curve.png", "Sharpness Loss", ["train_sharpness_loss", "val_sharpness_loss"])
     plot_history(history, output_dir / "peak_curve.png", "Peak Confidence", ["train_peak_a1_mean", "val_peak_a1_mean"])
     plot_history(history, output_dir / "mask_curve.png", "Mask Activity", ["train_mask_mean", "val_mask_mean", "train_active_points", "val_active_points"])
     save_json(
@@ -159,7 +165,7 @@ def train(args: argparse.Namespace) -> None:
             "patience": args.patience,
             "min_delta": args.min_delta,
             "corr_temperature": model.corr_temperature,
-            "matchability_k": model.matchability_k,
+            "lambda_sharp": model.lambda_sharp,
         },
         output_dir / "summary.json",
     )
@@ -176,7 +182,7 @@ def evaluate(args: argparse.Namespace) -> None:
         depth_max=ckpt["depth_max"],
         eps=ckpt["eps"],
         corr_temperature=ckpt.get("corr_temperature", 0.07),
-        matchability_k=ckpt.get("matchability_k", 2.0),
+        lambda_sharp=ckpt.get("lambda_sharp", 0.02),
     ).to(args.device)
     model.load_state_dict(ckpt["model_state"])
     loader = build_loader(args.data_root, args.split, args.batch_size, shuffle=False)
@@ -201,7 +207,7 @@ def build_argparser() -> argparse.ArgumentParser:
     train_parser.add_argument("--patience", type=int, default=4)
     train_parser.add_argument("--min-delta", type=float, default=1e-4)
     train_parser.add_argument("--corr-temperature", type=float, default=0.07)
-    train_parser.add_argument("--matchability-k", type=float, default=2.0)
+    train_parser.add_argument("--lambda-sharp", type=float, default=0.02)
 
     eval_parser = sub.add_parser("eval")
     eval_parser.add_argument("--data-root", type=str, required=True)

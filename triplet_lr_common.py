@@ -113,7 +113,7 @@ class TripletLRSelfSupModel(nn.Module):
         depth_max: float = 2.2,
         eps: float = 1e-3,
         corr_temperature: float = 0.07,
-        matchability_k: float = 2.0,
+        lambda_sharp: float = 0.02,
     ) -> None:
         super().__init__()
         self.encoder = RegionEncoder(out_channels=128)
@@ -124,7 +124,7 @@ class TripletLRSelfSupModel(nn.Module):
         self.depth_max = depth_max
         self.eps = eps
         self.corr_temperature = corr_temperature
-        self.matchability_k = matchability_k
+        self.lambda_sharp = lambda_sharp
 
     def forward(self, img_t: torch.Tensor, img_t1: torch.Tensor, img_t2: torch.Tensor, tau1_x: torch.Tensor, tau2_x: torch.Tensor, K: torch.Tensor) -> dict[str, torch.Tensor]:
         f_t = self.encoder(img_t)
@@ -153,23 +153,32 @@ class TripletLRSelfSupModel(nn.Module):
         q_actual_y = ys
 
         peak_a1 = a1.max(dim=1).values
-        peak_threshold = self.matchability_k / float(self.correlation.kernel_size)
-        matchable = peak_a1 > peak_threshold
         visible = (
             (q_pred_x >= 0.0)
             & (q_pred_x <= (w - 1))
             & (q_pred_y >= 0.0)
             & (q_pred_y <= (h - 1))
         )
-        m_phys = matchable & visible
+        m_phys = visible
         m = m_phys.float()
 
-        point_loss = (q_pred_x - q_actual_x) ** 2 + (q_pred_y - q_actual_y) ** 2
+        point_loss = (q_pred_x - q_actual_x) ** 2
         perpoint_loss = (point_loss * m).sum() / m.sum().clamp_min(1.0)
-        loss = perpoint_loss
+        probs1 = a1.clamp_min(1e-12)
+        probs2 = a2.clamp_min(1e-12)
+        entropy1 = -(probs1 * probs1.log()).sum(dim=1)
+        entropy2 = -(probs2 * probs2.log()).sum(dim=1)
+        entropy_norm = float(np.log(self.correlation.kernel_size))
+        entropy1_norm = entropy1 / entropy_norm
+        entropy2_norm = entropy2 / entropy_norm
+        sharpness_loss = ((((entropy1_norm + entropy2_norm) * 0.5) * m).sum() / m.sum().clamp_min(1.0))
+        loss = perpoint_loss + self.lambda_sharp * sharpness_loss
         return {
             "loss": loss,
             "perpoint_loss": perpoint_loss,
+            "sharpness_loss": sharpness_loss,
+            "entropy1_norm": entropy1_norm,
+            "entropy2_norm": entropy2_norm,
             "f_t": f_t,
             "f_t1": f_t1,
             "f_t2": f_t2,
@@ -183,7 +192,6 @@ class TripletLRSelfSupModel(nn.Module):
             "d_rel": d_rel,
             "delta_u": delta_u,
             "peak_a1": peak_a1,
-            "peak_threshold": torch.tensor(peak_threshold, device=c1.device),
             "q_pred_x": q_pred_x,
             "q_pred_y": q_pred_y,
             "q_actual_x": q_actual_x,

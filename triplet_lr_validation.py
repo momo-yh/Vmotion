@@ -43,7 +43,7 @@ def load_backbone(checkpoint_path: str | Path, device: str) -> TripletLRSelfSupM
         depth_max=ckpt["depth_max"],
         eps=ckpt["eps"],
         corr_temperature=ckpt.get("corr_temperature", 0.07),
-        matchability_k=ckpt.get("matchability_k", 2.0),
+        lambda_sharp=ckpt.get("lambda_sharp", 0.02),
     )
     model.load_state_dict(ckpt["model_state"])
     model.to(device).eval()
@@ -184,6 +184,14 @@ def select_extreme_samples(data_root: str | Path, split: str) -> dict[str, str]:
     return {k: v[1] for k, v in best.items()}
 
 
+def interior_point_mask(height: int, width: int, margin: int) -> np.ndarray:
+    mask = np.zeros((height, width), dtype=bool)
+    if height <= 2 * margin or width <= 2 * margin:
+        return mask
+    mask[margin: height - margin, margin: width - margin] = True
+    return mask
+
+
 @torch.no_grad()
 def get_model_outputs(model: TripletLRSelfSupModel, sample: dict, device: str) -> dict[str, torch.Tensor]:
     return model(
@@ -222,12 +230,21 @@ def visualize_correspondence(model: TripletLRSelfSupModel, data_root: str, split
     img_t1 = Image.open(sample_dir / "img_t1.png").convert("RGB")
     out = get_model_outputs(model, sample, device)
     c1 = out["c1"][0].detach().cpu()
+    valid = out["valid"][0].detach().cpu().numpy().astype(bool)
     radius = model.radius
     dx = correlation_offsets(radius, "cpu")
     peak = c1.argmax(dim=0).numpy()
     offset_x = dx.numpy()[peak]
     conf = torch.softmax(c1, dim=0).max(dim=0).values.numpy()
-    chosen_idx = np.argsort(conf.reshape(-1))[::-1][:num_points]
+    interior = interior_point_mask(c1.shape[1], c1.shape[2], radius)
+    candidate_mask = valid & interior
+    candidate_idx = np.flatnonzero(candidate_mask.reshape(-1))
+    if candidate_idx.size == 0:
+        candidate_idx = np.flatnonzero(interior.reshape(-1))
+    if candidate_idx.size == 0:
+        candidate_idx = np.arange(conf.size)
+    order = candidate_idx[np.argsort(conf.reshape(-1)[candidate_idx])[::-1]]
+    chosen_idx = order if num_points <= 0 else order[: min(num_points, order.size)]
 
     canvas = Image.new("RGB", (img_t.width * 2 + 20, img_t.height), color=(255, 255, 255))
     canvas.paste(img_t, (0, 0))
@@ -298,12 +315,20 @@ def visualize_match_patches(model: TripletLRSelfSupModel, data_root: str, split:
     out = get_model_outputs(model, sample, device)
     c1 = out["c1"][0].detach().cpu()
     a1 = out["a1"][0].detach().cpu()
+    valid = out["valid"][0].detach().cpu().numpy().astype(bool)
     radius = model.radius
     dx = correlation_offsets(radius, "cpu")
     peak = c1.argmax(dim=0)
     conf = a1.max(dim=0).values.numpy().reshape(-1)
-    order_hi = np.argsort(conf)[::-1][:top_k]
-    order_lo = np.argsort(conf)[:low_k]
+    interior = interior_point_mask(c1.shape[1], c1.shape[2], radius).reshape(-1)
+    candidate_idx = np.flatnonzero((valid.reshape(-1)) & interior)
+    if candidate_idx.size == 0:
+        candidate_idx = np.flatnonzero(interior)
+    if candidate_idx.size == 0:
+        candidate_idx = np.arange(conf.size)
+    conf_candidates = conf[candidate_idx]
+    order_hi = candidate_idx[np.argsort(conf_candidates)[::-1][:top_k]]
+    order_lo = candidate_idx[np.argsort(conf_candidates)[:low_k]]
 
     def draw_group(indices, out_name, title_prefix):
         fig, axes = plt.subplots(len(indices), 4, figsize=(10, 3 * len(indices)))
@@ -360,6 +385,7 @@ def export_sharp_peak_points(model: TripletLRSelfSupModel, data_root: str, split
     out = get_model_outputs(model, sample, device)
     c1 = out["c1"][0].detach().cpu()
     a1 = out["a1"][0].detach().cpu()
+    valid = out["valid"][0].detach().cpu().numpy().astype(bool)
     dx = correlation_offsets(model.radius, "cpu")
 
     probs = a1.view(a1.shape[0], -1).transpose(0, 1)
@@ -367,7 +393,16 @@ def export_sharp_peak_points(model: TripletLRSelfSupModel, data_root: str, split
     entropy = -(probs.clamp_min(1e-12) * probs.clamp_min(1e-12).log()).sum(dim=1)
     sharpness = top2_vals[:, 0] - top2_vals[:, 1]
     score = sharpness - 0.05 * entropy
-    chosen_idx = torch.topk(score, k=min(top_k, score.numel())).indices.tolist()
+    interior = interior_point_mask(c1.shape[1], c1.shape[2], model.radius).reshape(-1)
+    candidate_mask = torch.from_numpy((valid.reshape(-1)) & interior)
+    candidate_idx = torch.nonzero(candidate_mask, as_tuple=False).squeeze(1)
+    if candidate_idx.numel() == 0:
+        candidate_idx = torch.nonzero(torch.from_numpy(interior), as_tuple=False).squeeze(1)
+    if candidate_idx.numel() == 0:
+        candidate_idx = torch.arange(score.numel())
+    candidate_scores = score[candidate_idx]
+    chosen_local = torch.topk(candidate_scores, k=min(top_k, candidate_scores.numel())).indices
+    chosen_idx = candidate_idx[chosen_local].tolist()
 
     records = []
     canvas = Image.new("RGB", (img_t.width * 2 + 20, img_t.height), color=(255, 255, 255))
@@ -582,7 +617,7 @@ def run_bundle(args: argparse.Namespace) -> None:
     model = load_backbone(args.backbone_checkpoint, args.device)
 
     visualize_motion_response(model, args.data_root, "test", output_dir, args.device)
-    visualize_correspondence(model, args.data_root, "test", output_dir, args.device)
+    visualize_correspondence(model, args.data_root, "test", output_dir, args.device, num_points=0)
     dense_corr_metrics = visualize_dense_correspondence(model, args.data_root, "test", output_dir, args.device)
     patch_metrics = visualize_match_patches(model, args.data_root, "test", output_dir, args.device)
     sharp_peak_metrics = export_sharp_peak_points(model, args.data_root, "test", output_dir, args.device)
@@ -612,7 +647,7 @@ def run_bundle(args: argparse.Namespace) -> None:
     random_model = TripletLRSelfSupModel(
         radius=model.radius,
         corr_temperature=model.corr_temperature,
-        matchability_k=model.matchability_k,
+        lambda_sharp=model.lambda_sharp,
     ).to(args.device).eval()
     for p in random_model.parameters():
         p.requires_grad = False
@@ -661,6 +696,21 @@ def run_bundle(args: argparse.Namespace) -> None:
 
 
 def write_report(output_dir: Path, summary: dict) -> None:
+    embedded_pngs = [
+        ("Motion Left", "motion_response/left.png"),
+        ("Motion Right", "motion_response/right.png"),
+        ("Correspondence Overlay", "correspondence/overlay.png"),
+        ("Dense Correspondence", "correspondence_dense/dense_correspondence.png"),
+        ("Sharp Peaks", "sharp_peaks/sharp_peaks_overlay.png"),
+        ("Top Match Patches", "match_patches/top_match_patches.png"),
+        ("Low Match Patches", "match_patches/low_match_patches.png"),
+        ("Geometric Depth", "depth_recovery/geometric.png"),
+        ("GT Comparison", "depth_recovery/gt_comparison.png"),
+        ("Encoder Features", "encoder_features/encoder_feature_maps.png"),
+        ("Correlation Probe Depth", "depth_probe_corr/eval_test/pred_depth.png"),
+        ("Random Probe Depth", "depth_probe_random/eval_test/pred_depth.png"),
+        ("Single-Frame Probe Depth", "depth_probe_single_frame/eval_test/pred_depth.png"),
+    ]
     lines = [
         "# Three-Frame LR Validation Report",
         "",
@@ -713,7 +763,13 @@ def write_report(output_dir: Path, summary: dict) -> None:
         "- `depth_probe_random/eval_test/pred_depth.png`",
         "- `depth_probe_single_frame/eval_test/pred_depth.png`",
         "",
+        "## Embedded PNGs",
+        "",
     ]
+    for title, rel_path in embedded_pngs:
+        if (output_dir / rel_path).exists():
+            lines.append(f"![{title}]({rel_path})")
+            lines.append("")
     (output_dir / "report.md").write_text("\n".join(lines), encoding="utf-8")
 
 
