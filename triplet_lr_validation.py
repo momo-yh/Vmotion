@@ -43,6 +43,7 @@ def load_backbone(checkpoint_path: str | Path, device: str) -> TripletLRSelfSupM
         depth_max=ckpt["depth_max"],
         eps=ckpt["eps"],
         corr_temperature=ckpt.get("corr_temperature", 0.07),
+        matchability_k=ckpt.get("matchability_k", 2.0),
     )
     model.load_state_dict(ckpt["model_state"])
     model.to(device).eval()
@@ -139,8 +140,14 @@ class TripletValidationDataset(Dataset):
 
     def __getitem__(self, index: int) -> dict:
         item = self.base[index]
-        meta = load_json(self.data_root / self.split / item["sample_id"] / "meta.json")
-        depth, mask = compute_depth_map(meta, key_suffix="t1")
+        sample_dir = self.data_root / self.split / item["sample_id"]
+        depth_path = sample_dir / "depth_t1.npy"
+        if depth_path.exists():
+            depth = np.load(depth_path).astype(np.float32)
+            mask = (depth > 0.0).astype(np.float32)
+        else:
+            meta = load_json(sample_dir / "meta.json")
+            depth, mask = compute_depth_map(meta, key_suffix="t1")
         depth_lr, mask_lr = downsample_depth(depth, mask, out_size=32)
         item["depth_lr"] = depth_lr
         item["mask_lr"] = mask_lr
@@ -216,10 +223,9 @@ def visualize_correspondence(model: TripletLRSelfSupModel, data_root: str, split
     out = get_model_outputs(model, sample, device)
     c1 = out["c1"][0].detach().cpu()
     radius = model.radius
-    dx, dy = correlation_offsets(radius, "cpu")
+    dx = correlation_offsets(radius, "cpu")
     peak = c1.argmax(dim=0).numpy()
     offset_x = dx.numpy()[peak]
-    offset_y = dy.numpy()[peak]
     conf = torch.softmax(c1, dim=0).max(dim=0).values.numpy()
     chosen_idx = np.argsort(conf.reshape(-1))[::-1][:num_points]
 
@@ -232,7 +238,7 @@ def visualize_correspondence(model: TripletLRSelfSupModel, data_root: str, split
         y = idx // c1.shape[2]
         x = idx % c1.shape[2]
         p0 = (float((x + 0.5) * scale), float((y + 0.5) * scale))
-        p1 = (float(img_t.width + 20 + (x + offset_x[y, x] + 0.5) * scale), float((y + offset_y[y, x] + 0.5) * scale))
+        p1 = (float(img_t.width + 20 + (x + offset_x[y, x] + 0.5) * scale), float((y + 0.5) * scale))
         draw.line((p0[0], p0[1], p1[0], p1[1]), fill=(40, 170, 255), width=1)
     canvas.save(output_dir / "overlay.png")
 
@@ -247,12 +253,10 @@ def visualize_dense_correspondence(model: TripletLRSelfSupModel, data_root: str,
     out = get_model_outputs(model, sample, device)
     c1 = out["c1"][0].detach().cpu()
     a1 = out["a1"][0].detach().cpu()
-    radius = model.radius
-    dx, dy = correlation_offsets(radius, "cpu")
+    dx = correlation_offsets(model.radius, "cpu")
     peak = c1.argmax(dim=0)
     conf = a1.max(dim=0).values.numpy()
     peak_dx = dx[peak].numpy()
-    peak_dy = dy[peak].numpy()
     mean_abs_dx = float(np.abs(peak_dx).mean())
     std_dx = float(np.std(peak_dx))
     frac_center = float((peak_dx == 0).mean())
@@ -295,7 +299,7 @@ def visualize_match_patches(model: TripletLRSelfSupModel, data_root: str, split:
     c1 = out["c1"][0].detach().cpu()
     a1 = out["a1"][0].detach().cpu()
     radius = model.radius
-    dx, dy = correlation_offsets(radius, "cpu")
+    dx = correlation_offsets(radius, "cpu")
     peak = c1.argmax(dim=0)
     conf = a1.max(dim=0).values.numpy().reshape(-1)
     order_hi = np.argsort(conf)[::-1][:top_k]
@@ -312,8 +316,8 @@ def visualize_match_patches(model: TripletLRSelfSupModel, data_root: str, split:
             px = float((x + 0.5) * model.downsample)
             py = float((y + 0.5) * model.downsample)
             qx = float((x + dx[peak_idx].item() + 0.5) * model.downsample)
-            qy = float((y + dy[peak_idx].item() + 0.5) * model.downsample)
-            patch = c1[:, y, x].reshape(2 * radius + 1, 2 * radius + 1).numpy()
+            qy = py
+            patch = c1[:, y, x].numpy()[None, :]
 
             ax0, ax1, ax2, ax3 = axes[row]
             ax0.imshow(img_t)
@@ -327,11 +331,11 @@ def visualize_match_patches(model: TripletLRSelfSupModel, data_root: str, split:
             ax1.axis("off")
 
             ax2.imshow(patch, cmap="viridis")
-            ax2.set_title(f"corr patch\nconf={conf[flat_idx]:.3f}")
+            ax2.set_title(f"corr strip\nconf={conf[flat_idx]:.3f}")
             ax2.axis("off")
 
             ax3.imshow(torch.softmax(torch.from_numpy(patch.reshape(-1)), dim=0).reshape(patch.shape).numpy(), cmap="magma")
-            ax3.set_title("softmax patch")
+            ax3.set_title("softmax strip")
             ax3.axis("off")
         fig.tight_layout()
         fig.savefig(output_dir / out_name, dpi=180)
@@ -356,8 +360,7 @@ def export_sharp_peak_points(model: TripletLRSelfSupModel, data_root: str, split
     out = get_model_outputs(model, sample, device)
     c1 = out["c1"][0].detach().cpu()
     a1 = out["a1"][0].detach().cpu()
-    radius = model.radius
-    dx, dy = correlation_offsets(radius, "cpu")
+    dx = correlation_offsets(model.radius, "cpu")
 
     probs = a1.view(a1.shape[0], -1).transpose(0, 1)
     top2_vals, top2_idx = torch.topk(probs, k=2, dim=1)
@@ -379,7 +382,7 @@ def export_sharp_peak_points(model: TripletLRSelfSupModel, data_root: str, split
         px = float((x + 0.5) * model.downsample)
         py = float((y + 0.5) * model.downsample)
         qx = float((x + dx[peak_idx].item() + 0.5) * model.downsample)
-        qy = float((y + dy[peak_idx].item() + 0.5) * model.downsample)
+        qy = py
         records.append(
             {
                 "rank": rank,
@@ -415,7 +418,7 @@ def evaluate_matching_error(model: TripletLRSelfSupModel, data_root: str, split:
         out = get_model_outputs(model, sample, device)
         c1 = out["c1"][0].detach().cpu()
         peak = c1.argmax(dim=0)
-        dx, _ = correlation_offsets(model.radius, "cpu")
+        dx = correlation_offsets(model.radius, "cpu")
         pred_disp = dx[peak].numpy() * model.downsample
         depth = sample["depth_lr"].numpy()
         mask = sample["mask_lr"].numpy() > 0
@@ -606,7 +609,11 @@ def run_bundle(args: argparse.Namespace) -> None:
             )
         return out["c1"]
 
-    random_model = TripletLRSelfSupModel(radius=model.radius).to(args.device).eval()
+    random_model = TripletLRSelfSupModel(
+        radius=model.radius,
+        corr_temperature=model.corr_temperature,
+        matchability_k=model.matchability_k,
+    ).to(args.device).eval()
     for p in random_model.parameters():
         p.requires_grad = False
 
@@ -628,11 +635,11 @@ def run_bundle(args: argparse.Namespace) -> None:
         return feats
 
     corr_dir = ensure_dir(output_dir / "depth_probe_corr")
-    corr_best = train_depth_decoder(train_loader, val_loader, corr_feature_fn, (2 * model.radius + 1) ** 2, args.device, corr_dir, args.decoder_epochs, args.lr)
+    corr_best = train_depth_decoder(train_loader, val_loader, corr_feature_fn, 2 * model.radius + 1, args.device, corr_dir, args.decoder_epochs, args.lr)
     corr_metrics = eval_depth_decoder(test_loader, corr_feature_fn, corr_best, args.device, corr_dir / "eval_test")
 
     rand_dir = ensure_dir(output_dir / "depth_probe_random")
-    rand_best = train_depth_decoder(train_loader, val_loader, corr_random_feature_fn, (2 * model.radius + 1) ** 2, args.device, rand_dir, args.decoder_epochs, args.lr)
+    rand_best = train_depth_decoder(train_loader, val_loader, corr_random_feature_fn, 2 * model.radius + 1, args.device, rand_dir, args.decoder_epochs, args.lr)
     rand_metrics = eval_depth_decoder(test_loader, corr_random_feature_fn, rand_best, args.device, rand_dir / "eval_test")
 
     sf_dir = ensure_dir(output_dir / "depth_probe_single_frame")

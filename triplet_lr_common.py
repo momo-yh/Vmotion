@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import math
 import random
 from pathlib import Path
 
@@ -95,20 +94,27 @@ class LocalCorrelation(nn.Module):
         bsz, channels, height, width = f_a.shape
         a = F.normalize(f_a, dim=1)
         b = F.normalize(f_b, dim=1)
-        patches = F.unfold(b, kernel_size=self.kernel_size, padding=self.radius)
-        patches = patches.view(bsz, channels, self.kernel_size * self.kernel_size, height, width)
+        patches = F.unfold(b, kernel_size=(1, self.kernel_size), padding=(0, self.radius))
+        patches = patches.view(bsz, channels, self.kernel_size, height, width)
         corr = (a.unsqueeze(2) * patches).sum(dim=1) / self.temperature
         return corr
 
 
-def correlation_offsets(radius: int, device: str | torch.device) -> tuple[torch.Tensor, torch.Tensor]:
-    coords = torch.arange(-radius, radius + 1, dtype=torch.float32, device=device)
-    dx, dy = torch.meshgrid(coords, coords, indexing="xy")
-    return dx.reshape(-1), dy.reshape(-1)
+def correlation_offsets(radius: int, device: str | torch.device) -> torch.Tensor:
+    return torch.arange(-radius, radius + 1, dtype=torch.float32, device=device)
 
 
 class TripletLRSelfSupModel(nn.Module):
-    def __init__(self, radius: int = 6, downsample: int = 4, depth_min: float = 0.2, depth_max: float = 2.2, eps: float = 1e-3, corr_temperature: float = 0.07) -> None:
+    def __init__(
+        self,
+        radius: int = 6,
+        downsample: int = 4,
+        depth_min: float = 0.2,
+        depth_max: float = 2.2,
+        eps: float = 1e-3,
+        corr_temperature: float = 0.07,
+        matchability_k: float = 2.0,
+    ) -> None:
         super().__init__()
         self.encoder = RegionEncoder(out_channels=128)
         self.correlation = LocalCorrelation(radius=radius, temperature=corr_temperature)
@@ -118,6 +124,7 @@ class TripletLRSelfSupModel(nn.Module):
         self.depth_max = depth_max
         self.eps = eps
         self.corr_temperature = corr_temperature
+        self.matchability_k = matchability_k
 
     def forward(self, img_t: torch.Tensor, img_t1: torch.Tensor, img_t2: torch.Tensor, tau1_x: torch.Tensor, tau2_x: torch.Tensor, K: torch.Tensor) -> dict[str, torch.Tensor]:
         f_t = self.encoder(img_t)
@@ -126,12 +133,11 @@ class TripletLRSelfSupModel(nn.Module):
         c1 = self.correlation(f_t, f_t1)
         c2 = self.correlation(f_t1, f_t2)
 
-        dx_offsets, dy_offsets = correlation_offsets(self.radius, c1.device)
+        dx_offsets = correlation_offsets(self.radius, c1.device)
         a1 = torch.softmax(c1, dim=1)
         a2 = torch.softmax(c2, dim=1)
         mu1_x = (a1 * dx_offsets.view(1, -1, 1, 1)).sum(dim=1)
         mu2_x = (a2 * dx_offsets.view(1, -1, 1, 1)).sum(dim=1)
-        mu2_y = (a2 * dy_offsets.view(1, -1, 1, 1)).sum(dim=1)
 
         fx = K[:, 0, 0].view(-1, 1, 1)
         delta_u = mu1_x * float(self.downsample)
@@ -144,21 +150,26 @@ class TripletLRSelfSupModel(nn.Module):
         q_pred_x = xs + mu1_x * (tau2_x.view(-1, 1, 1) / (tau1_x.view(-1, 1, 1) + self.eps * torch.sign(tau1_x).view(-1, 1, 1)))
         q_pred_y = ys
         q_actual_x = xs + mu2_x
-        q_actual_y = ys + mu2_y
+        q_actual_y = ys
 
-        valid = (
-            torch.isfinite(depth_raw)
-            & (depth_raw > 0.0)
-            & (q_pred_x >= 0.0)
+        peak_a1 = a1.max(dim=1).values
+        peak_threshold = self.matchability_k / float(self.correlation.kernel_size)
+        matchable = peak_a1 > peak_threshold
+        visible = (
+            (q_pred_x >= 0.0)
             & (q_pred_x <= (w - 1))
             & (q_pred_y >= 0.0)
             & (q_pred_y <= (h - 1))
         )
+        m_phys = matchable & visible
+        m = m_phys.float()
 
         point_loss = (q_pred_x - q_actual_x) ** 2 + (q_pred_y - q_actual_y) ** 2
-        loss = (point_loss * valid.float()).sum() / valid.float().sum().clamp_min(1.0)
+        perpoint_loss = (point_loss * m).sum() / m.sum().clamp_min(1.0)
+        loss = perpoint_loss
         return {
             "loss": loss,
+            "perpoint_loss": perpoint_loss,
             "f_t": f_t,
             "f_t1": f_t1,
             "f_t2": f_t2,
@@ -168,12 +179,19 @@ class TripletLRSelfSupModel(nn.Module):
             "a2": a2,
             "mu1_x": mu1_x,
             "mu2_x": mu2_x,
-            "mu2_y": mu2_y,
             "depth_raw": depth_raw,
             "d_rel": d_rel,
+            "delta_u": delta_u,
+            "peak_a1": peak_a1,
+            "peak_threshold": torch.tensor(peak_threshold, device=c1.device),
             "q_pred_x": q_pred_x,
+            "q_pred_y": q_pred_y,
             "q_actual_x": q_actual_x,
-            "valid": valid,
+            "q_actual_y": q_actual_y,
+            "mask": m,
+            "valid": m_phys,
+            "point_loss": point_loss,
+            "active_points": m.flatten(1).sum(dim=1),
         }
 
 

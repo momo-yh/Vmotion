@@ -113,14 +113,15 @@ This is why the current implementation does not yet include:
 - explicit image-center relation modeling
 - explicit geometric relation modeling among multiple local regions
 
-## 3) Detailed Implementation
+## 3) Updated Implementation Settings
 
-The implementation has four parts:
+The implementation has five parts:
 
-- a region encoder
-- a local correlation module
-- a per-point supervision module
-- a training objective
+- a shared encoder
+- a 1D horizontal correlation module
+- soft displacement recovery
+- depth-based third-frame prediction
+- a single per-point loss with a hard physical mask
 
 ### 3.1 Region Encoder
 
@@ -135,13 +136,13 @@ with:
 - `s = 4`
 - `H' = H / s`
 - `W' = W / s`
-- `d = 128`
+- `d = 64`
 
 Encoder architecture:
 
 - `Conv 3 -> 32`, `3x3`, stride `1`, ReLU
-- `Conv 32 -> 64`, `3x3`, stride `2`, ReLU
-- `Conv 64 -> 128`, `3x3`, stride `2`, ReLU
+- `Conv 32 -> 64`, `3x3`, stride `1`, ReLU
+- `Conv 64 -> 64`, `3x3`, stride `2`, ReLU
 
 Design reasons:
 
@@ -150,104 +151,149 @@ Design reasons:
 - stride `2` on layers 2 and 3 reduces correlation cost
 - shared weights enforce temporal consistency across frames
 
-### 3.2 Local Correlation Module
+### 3.2 1D Horizontal Correlation Module
 
-For each position `p` in the feature map, define a local search window:
+For each position `p` in the feature map, define a 1D horizontal search window:
 
 ```text
-N_r(p) = { q : ||q - p||_inf <= r }
+N_r^1D(p) = { q : |q_x - p_x| <= r, q_y = p_y }
 ```
+
+This restriction is required by the motion scope.
+Under left-right translation:
+
+```text
+Delta v(p) ~= 0
+```
+
+Vertical search therefore introduces physically irrelevant candidates,
+flattens the softmax, and corrupts the displacement estimate.
 
 Precondition:
 
 ```text
-r >= max_p ||Delta p(p)||_inf / s
+r >= max_p |Delta u(p)| / s
 ```
 
-Practical data constraint:
+The matching score uses cosine similarity with fixed temperature scaling:
 
 ```text
-|u_t+1 - u_t| must be large enough to be measurable on the image
+C_1(p, dx) = <F~_t(p), F~_t+1(p + dx x_hat)> / tau
+C_2(p, dx) = <F~_t+1(p), F~_t+2(p + dx x_hat)> / tau
 ```
 
-If motion is too small:
+where:
 
-- the correlation peak becomes too flat
-- depth inversion becomes numerically unstable
-- training can stall without learning useful correspondence
+- `F~` denotes L2-normalized features
+- `tau = 0.07` is fixed and not learned
 
-Scaled dot-product score:
+Both correlation volumes therefore have shape:
 
 ```text
-C_1(p, q) = F_t(p)^T F_t+1(q) / sqrt(d)
-C_2(p, q) = F_t+1(p)^T F_t+2(q) / sqrt(d)
+[B, H', W', (2r+1)]
 ```
 
-Both correlation volumes have shape:
+### 3.3 Soft Displacement and Depth Recovery
+
+Step 1: soft displacement from the two correlation strips
 
 ```text
-[B, H', W', (2r+1)^2]
+a_1(p, dx) = softmax_dx C_1(p, dx)
+a_2(p, dx) = softmax_dx C_2(p, dx)
+
+mu_1x(p)   = sum_dx a_1(p, dx) * dx
+mu_2x(p)   = sum_dx a_2(p, dx) * dx
 ```
 
-### 3.3 Per-Point Supervision Module
+This is a differentiable approximation of the matching peak.
+If `a_1(p, .)` is flat, then `mu_1x(p)` stays near zero and the point is later
+rejected by the hard mask.
 
-Step 1: soft displacement from `C_1`
+Step 2: recover relative depth from the first frame pair
 
 ```text
-a_1(p, q) = softmax_q C_1(p, q)
-mu_1x(p)  = sum_q a_1(p, q) * (q_x - p_x)
-Delta u(p)= mu_1x(p) * s
+Delta u(p) = mu_1x(p) * s
+D_rel(p)   = fx * tau_1x / (Delta u(p) + eps)
 ```
 
-Step 2: relative depth recovery
+with clipping to `[D_min, D_max]`.
 
-```text
-D_rel(p) = fx * tau_1x / (Delta u(p) + eps)
-```
+This uses only the displacement-depth relation.
+No depth label is used anywhere in the pipeline.
 
-with clipping to a valid range `[D_min, D_max]`.
+### 3.4 Third-Frame Prediction and Hard Mask
 
 Step 3: predict the position in frame `t+2`
 
-For the current left-right only setting:
+For the current left-right-only setting:
 
 ```text
 q_pred_x(p) = p_x + fx * tau_2x / (D_rel(p) * s)
 q_pred_y(p) = p_y
 ```
 
-The sign follows the implementation convention used in the generated dataset.
+This is exact under pure horizontal translation.
 
 Step 4: actual position from `C_2`
 
 ```text
-a_2(p, q)    = softmax_q C_2(p, q)
-mu_2(p)      = sum_q a_2(p, q) * (q - p)
-q_actual(p)  = p + mu_2(p)
+q_actual_x(p) = p_x + mu_2x(p)
+q_actual_y(p) = p_y
 ```
 
-Step 5: validity mask
+Step 5: hard physical mask
 
-A point is valid if:
+Only points that satisfy both physically necessary conditions are supervised.
 
-- `D_rel(p) > 0`
-- `q_pred(p)` stays inside the feature map
+Condition 1: the point is matchable
 
-### 3.4 Training Objective
+```text
+peak(a_1(p, .)) > k / (2r+1)
+```
+
+If the strip is nearly flat, then the point is textureless or ambiguous and
+`mu_1x(p)` is not a reliable displacement estimate.
+
+Condition 2: the point is still visible in frame `t+2`
+
+```text
+q_pred(p) in Omega'
+```
+
+If the point moves outside the field of view, then there is no valid
+observation to compare against.
+
+The hard mask is therefore:
+
+```text
+m(p) = 1 if both conditions hold, else 0
+```
+
+### 3.5 Training Objective
+
+Each training triplet must satisfy a minimum measurable displacement at the
+scene center:
+
+```text
+|Delta u_center| >= 8 px
+```
+
+Samples below this threshold are excluded from training.
+This keeps `D_rel` numerically stable across the dataset.
 
 Per-point loss:
 
 ```text
-L(p) = || q_pred(p) - q_actual(p) ||^2
+L(p) = (q_pred_x(p) - q_actual_x(p))^2
 ```
 
 Total loss:
 
 ```text
-L = mean over valid p of L(p)
+L = mean over { p : m(p) = 1 } of L(p)
 ```
 
-This forces the encoder to learn features whose correlation peaks are geometrically consistent across motion history.
+This is the only loss term in the final cleaned version.
 
 ## 4) Validation
 
@@ -345,12 +391,20 @@ Interpretation:
 
 The active experiment bundle for this setting is:
 
-1. generate a three-frame, left-right-only two-ball dataset
-2. train the three-frame self-supervised model with per-point consistency loss
-3. evaluate Stage 1 training behavior
-4. run claim-wise validation
-5. train a shallow correlation-based depth decoder
-6. compare against:
+1. generate a three-frame, left-right-only dataset
+2. verify the two preconditions before training:
+   - minimum sample displacement is at least `8 px`
+   - search radius covers the maximum horizontal displacement
+3. train the self-supervised three-frame model with:
+   - shared encoder
+   - 1D horizontal correlation
+   - soft displacement recovery
+   - hard two-condition mask
+   - one per-point loss term
+4. evaluate Stage 1 training behavior
+5. run claim-wise validation
+6. train a shallow correlation-based depth decoder
+7. compare against:
    - random frozen encoder
    - single-frame feature probe
 
@@ -377,12 +431,17 @@ Case 4: Level A, Level B, and controls all support the same result
 
 ## 7) Shared Scene and Data Assumptions
 
-- two balls with different radii
-- one table and one background wall
+The setting is intentionally independent of any one visual scene template.
+Different datasets may use different object categories or layouts, as long as
+they respect the motion scope and preconditions.
+
+Shared assumptions:
+
 - static world; only camera motion changes
 - image resolution `128 x 128`
 - intrinsics `fx = fy = 100.0`, `cx = cy = 64.0`
 - current motion scope: pure left-right translation only
+- supervision uses no depth label during training
 
 Per-sample triplet data:
 
@@ -391,7 +450,7 @@ Per-sample triplet data:
 - `img_t2.png`
 - `meta.json`
 
-`meta.json` includes:
+`meta.json` includes at minimum:
 
 - `K`
 - `T_t_to_t1`
@@ -399,17 +458,26 @@ Per-sample triplet data:
 - `world_to_camera_t`
 - `world_to_camera_t1`
 - `world_to_camera_t2`
-- 2D and 3D ball centers in all three frames
 
-## 8) Current Success Criterion
+Optional dataset-specific metadata may include:
 
-The current root question gets initial support only if all of the following happen:
+- object centers
+- object sizes
+- object categories
+- precomputed depth maps for validation
 
-1. the self-supervised three-frame loss decreases clearly
-2. the motion field and correspondence visualizations are geometrically coherent
+## 8) Updated Success Criterion
+
+The root question gets support only if all of the following happen:
+
+1. the per-point loss decreases clearly on the masked valid set
+2. the 1D displacement field is spatially coherent and depth-aligned
 3. direct geometric depth recovery correlates with ground truth on valid regions
 4. the correlation-based depth probe beats both:
    - random frozen encoder
    - single-frame feature probe
 
-Before that, conclusions remain partial.
+Criterion 4 is the decisive test.
+The previous result showed the single-frame probe winning.
+The final cleaned setting is intentionally minimal so that any failure can be
+attributed directly to correspondence quality rather than to extra loss terms.
